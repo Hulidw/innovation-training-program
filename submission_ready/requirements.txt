@@ -1,0 +1,10 @@
+torch>=2.7,<2.8
+numpy>=1.24
+transformers==4.57.1
+peft==0.17.1
+accelerate==1.15.0
+datasets==4.8.5
+bitsandbytes==0.50.2
+sentencepiece==0.2.2
+safetensors==0.8.0
+jupyterlab==4.6.4

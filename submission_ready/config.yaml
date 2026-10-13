@@ -1,0 +1,14 @@
+seed: 42
+model: tiny
+mode: dynamic
+steps: 300
+batch_size: 32
+seq_len: 64
+lr: 0.002
+alpha: 32
+rank_budget: 16
+min_rank: 1
+max_rank: 8
+rank_step: 1
+allocation_interval: 25
+warmup_steps: 25

@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+runs/
+*.pt
+dynamic_lora_project/
+submission_ready.zip
