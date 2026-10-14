@@ -14,8 +14,13 @@ OUT.mkdir(exist_ok=True)
 stale_result = OUT/'results.json'
 if stale_result.exists():
     stale_result.unlink()
-for name in ['dynamic_lora.py','simple_train.py','experiment.py','train.py','cloud_qwen_experiment.py','gpu_smoke_test.py','README.md','requirements.txt','config.yaml','技术方案.md','提交清单.md','文件作用说明.md','改动记录.md','演示视频脚本.md','答辩PPT大纲.md','云端实验说明.md','云端Qwen实验说明.md']:
+for name in ['dynamic_lora.py','adaloora.py','simple_train.py','experiment.py','train.py','real_model_experiment.py','cloud_qwen_experiment.py','budget_sweep.py','generate_report.py','gpu_smoke_test.py','README.md','requirements.txt','config.yaml','技术方案.md','提交清单.md','文件作用说明.md','改动记录.md','演示视频脚本.md','答辩PPT大纲.md','云端实验说明.md','云端Qwen实验说明.md']:
     shutil.copy2(ROOT/name, OUT/name)
+
+# Keep the latest reproducible result summary beside the code when it exists.
+result_summary = ROOT / 'runs' / 'experiment_report.md'
+if result_summary.exists():
+    shutil.copy2(result_summary, OUT / '实验报告.md')
 
 pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
 styles=getSampleStyleSheet()

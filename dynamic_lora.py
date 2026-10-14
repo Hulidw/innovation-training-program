@@ -30,11 +30,18 @@ class DynamicLoRALinear(nn.Module):
         self.lora_B = nn.Parameter(torch.zeros(base.out_features, max_rank, **factory))
         nn.init.kaiming_uniform_(self.lora_A, a=5 ** 0.5)
         self.register_buffer("importance_ema", torch.zeros((), device=base.weight.device))
+        # 二阶矩 EMA：用于估计单步重要性信号的标准差（不确定度）。
+        self.register_buffer("importance_sq_ema", torch.zeros((), device=base.weight.device))
 
     def set_rank(self, rank: int):
         if not 1 <= rank <= self.max_rank:
             raise ValueError('rank must be between 1 and max_rank')
         self.rank = int(rank)
+
+    @property
+    def active_parameter_count(self) -> int:
+        """Number of low-rank parameters participating at the current rank."""
+        return self.rank * (self.base.in_features + self.base.out_features)
 
     def get_extra_state(self):
         # Plain Python attributes otherwise disappear in a state_dict checkpoint.
@@ -55,7 +62,7 @@ class DynamicLoRALinear(nn.Module):
         return y + update * self.scaling
 
     @torch.no_grad()
-    def update_importance(self, decay: float = 0.9):
+    def update_importance(self, decay: float = 0.9, track_variance: bool = False):
         if self.lora_A.grad is None or self.lora_B.grad is None:
             return self.importance_ema
         r = self.rank
@@ -63,7 +70,25 @@ class DynamicLoRALinear(nn.Module):
         score = (self.lora_A.grad[:r].float().abs().mean() * self.lora_B[:, :r].float().abs().mean()
                  + self.lora_A[:r].float().abs().mean() * self.lora_B.grad[:, :r].float().abs().mean())
         self.importance_ema.mul_(decay).add_(score * (1 - decay))
+        if track_variance:
+            self.importance_sq_ema.mul_(decay).add_(score * score * (1 - decay))
         return self.importance_ema
+
+    @torch.no_grad()
+    def uncertainty_score(self, beta: float, t: int, decay: float) -> torch.Tensor:
+        """不确定度感知评分（置信下界 LCB）: max(m_hat - beta * sigma_hat, 0)。
+
+        m_hat / s_hat 为带偏差修正的 EMA 一阶/二阶矩（类似 Adam 的 bias correction），
+        sigma_hat = sqrt(s_hat - m_hat^2) 估计单步重要性信号的标准差。
+        beta = 0 时退化为纯 EMA 均值。截断到非负：无可靠证据即视为不重要。
+        """
+        if beta <= 0.0 or t < 2:
+            return self.importance_ema
+        c = 1.0 - decay ** t
+        m_hat = self.importance_ema / c
+        s_hat = self.importance_sq_ema / c
+        var = (s_hat - m_hat * m_hat).clamp_min(0.0)
+        return (m_hat - beta * var.sqrt()).clamp_min(0.0)
 
 
 @dataclass
@@ -75,6 +100,10 @@ class AllocationConfig:
     # Conservative defaults reduce rank churn caused by minibatch noise.
     switch_threshold: float = 0.5
     ema_decay: float = 0.95
+    # 不确定度感知（置信下界 LCB）系数 beta；0 表示关闭（纯 EMA 均值）。
+    uncertainty_beta: float = 0.0
+    # 应用 LCB 前所需的最少观测步数（早期矩估计不可靠）。
+    min_samples: int = 10
 
 
 class DynamicRankAllocator:
@@ -89,9 +118,13 @@ class DynamicRankAllocator:
             raise ValueError('allocator max_rank exceeds a layer capacity')
         if not 0 <= config.ema_decay < 1 or not math.isfinite(config.switch_threshold) or config.switch_threshold < 0:
             raise ValueError('invalid EMA decay or switching threshold')
+        if config.uncertainty_beta < 0 or not math.isfinite(config.uncertainty_beta) or config.min_samples < 1:
+            raise ValueError('invalid uncertainty beta or min_samples')
         self.layers, self.config = layers, config
         self.effective_budget = max(config.min_rank * len(layers), min(config.budget, config.max_rank * len(layers)))
         self.history: List[dict] = []
+        # 已采集重要性信号的步数（用于 LCB 的偏差修正与启用门控）。
+        self._n_obs = 0
 
     def initialize_uniform(self):
         """The two comparison methods start with exactly the same active budget."""
@@ -103,8 +136,10 @@ class DynamicRankAllocator:
     @torch.no_grad()
     def observe(self):
         """Call after backward and before optimizer.step(), on every training step."""
+        self._n_obs += 1
+        track = self.config.uncertainty_beta > 0.0
         for layer in self.layers.values():
-            layer.update_importance(self.config.ema_decay)
+            layer.update_importance(self.config.ema_decay, track_variance=track)
 
     def _project(self, scores: Dict[str, float]) -> Dict[str, int]:
         names = list(self.layers)
@@ -142,11 +177,18 @@ class DynamicRankAllocator:
         if update_importance:
             self.observe()
         # One device-to-host transfer at allocation time, not one per layer/step.
-        values = torch.stack([l.importance_ema for l in self.layers.values()]).cpu().tolist()
+        use_lcb = self.config.uncertainty_beta > 0.0 and self._n_obs >= self.config.min_samples
+        if use_lcb:
+            values = torch.stack([
+                l.uncertainty_score(self.config.uncertainty_beta, self._n_obs, self.config.ema_decay)
+                for l in self.layers.values()
+            ]).cpu().tolist()
+        else:
+            values = torch.stack([l.importance_ema for l in self.layers.values()]).cpu().tolist()
         scores = dict(zip(self.layers, values))
         ranks = self._project(scores)
         for n, r in ranks.items(): self.layers[n].set_rank(r)
-        self.history.append({"step": step, "ranks": ranks, "importance": scores})
+        self.history.append({"step": step, "ranks": ranks, "importance": scores, "lcb": use_lcb})
         return ranks
 
 

@@ -155,6 +155,8 @@ def run_experiment(args, mode: str, tokenizer, train_texts, train_labels, eval_t
                 step=args.rank_step,
                 switch_threshold=args.switch_threshold,
                 ema_decay=args.ema_decay,
+                uncertainty_beta=args.uncertainty_beta if mode == "dynamic_u" else 0.0,
+                min_samples=args.min_samples,
             ),
         )
         allocator.initialize_uniform()
@@ -181,15 +183,15 @@ def run_experiment(args, mode: str, tokenizer, train_texts, train_labels, eval_t
         optimizer.zero_grad(set_to_none=True)
         loss = model(**batch).loss
         loss.backward()
-        if mode in ("dynamic", "adaloora"):
+        if mode in ("dynamic", "dynamic_u", "adaloora"):
             torch.nn.utils.clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad], args.max_grad_norm
             )
-            if mode == "dynamic":
+            if mode in ("dynamic", "dynamic_u"):
                 allocator.observe()
         optimizer.step()
 
-        if mode == "dynamic" and step >= args.warmup_steps and step % args.allocation_interval == 0:
+        if mode in ("dynamic", "dynamic_u") and step >= args.warmup_steps and step % args.allocation_interval == 0:
             allocator.rebalance(step, update_importance=False)
         if mode == "adaloora" and step >= args.warmup_steps and step % args.allocation_interval == 0:
             allocator.reallocate(step)
@@ -203,6 +205,14 @@ def run_experiment(args, mode: str, tokenizer, train_texts, train_labels, eval_t
         model, tokenizer, eval_texts, eval_labels, device, args.max_length, args.eval_batch_size
     )
 
+    if mode == "adaloora":
+        active_adapter_params = sum(
+            int(layer.active_mask.sum().item()) * (layer.base.in_features + layer.base.out_features)
+            for layer in layers.values()
+        )
+    else:
+        active_adapter_params = sum(layer.active_parameter_count for layer in layers.values())
+
     result = {
         "mode": mode,
         "model": args.model,
@@ -212,6 +222,8 @@ def run_experiment(args, mode: str, tokenizer, train_texts, train_labels, eval_t
         "eval_size": len(eval_texts),
         "target_layers": len(layers),
         "trainable_params": sum(p.numel() for p in model.parameters() if p.requires_grad),
+        "active_adapter_params": active_adapter_params,
+        "uncertainty_beta": args.uncertainty_beta if mode == "dynamic_u" else 0.0,
         "final_train_loss": losses[-1],
         "mean_last_20_train_loss": sum(losses[-20:]) / min(20, len(losses)),
         "eval_loss": eval_loss,
@@ -219,7 +231,7 @@ def run_experiment(args, mode: str, tokenizer, train_texts, train_labels, eval_t
         "peak_memory_gb": peak_mem,
         "seconds": elapsed,
         "steps_per_sec": args.steps / elapsed,
-        "rank_history": allocator.history if mode in ("dynamic", "adaloora") else [],
+        "rank_history": allocator.history if mode in ("dynamic", "dynamic_u", "adaloora") else [],
     }
 
     del optimizer, model
@@ -277,6 +289,14 @@ def main():
     parser.add_argument("--ema-decay", type=float, default=0.95)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--uncertainty-beta", type=float, default=1.0,
+                        help="dynamic_u 模式的 LCB 置信系数 beta（0 关闭）")
+    parser.add_argument("--min-samples", type=int, default=10,
+                        help="应用 LCB 前的最少重要性观测步数")
+    parser.add_argument("--modes", nargs="+",
+                        default=["uniform", "dynamic", "dynamic_u", "adaloora"],
+                        choices=["uniform", "dynamic", "dynamic_u", "adaloora"],
+                        help="要运行的对比方法，按给定顺序执行并输出")
     parser.add_argument("--output", default="runs/real_model")
     parser.add_argument("--target-names", nargs="+", default=["q_proj", "v_proj"])
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
@@ -293,9 +313,11 @@ def main():
     train_texts, train_labels, eval_prompts, eval_labels, tokenizer = load_and_prepare_data(args)
     print(f"[INFO] 训练样本: {len(train_texts)}, 评估样本: {len(eval_prompts)}")
     print(f"[INFO] 目标层: {args.target_names}, rank_budget={args.rank_budget}, max_rank={args.max_rank}")
+    if "dynamic_u" in args.modes and args.uncertainty_beta < 0:
+        raise SystemExit("uncertainty-beta must be non-negative")
 
     results = []
-    for mode in ("uniform", "dynamic", "adaloora"):
+    for mode in args.modes:
         print(f"\n{'='*60}")
         print(f"[INFO] 开始 {mode} 实验 ...")
         print(f"{'='*60}")
@@ -311,21 +333,40 @@ def main():
         json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    # 生成三方法对比摘要
-    uni, dyn, ada = results[0], results[1], results[2]
-    summary = (
-        "# 真实模型实验结果（Qwen2.5-0.5B-Instruct + GLUE SST-2）\n\n"
-        f"| 指标 | Uniform LoRA | Dynamic LoRA ( ours ) | AdaLoRA |\n"
-        f"|---|---|---|---|\n"
-        f"| 验证准确率 | {uni['eval_accuracy']:.4f} | {dyn['eval_accuracy']:.4f} | {ada['eval_accuracy']:.4f} |\n"
-        f"| 验证损失 | {uni['eval_loss']:.4f} | {dyn['eval_loss']:.4f} | {ada['eval_loss']:.4f} |\n"
-        f"| 最终训练损失 | {uni['final_train_loss']:.4f} | {dyn['final_train_loss']:.4f} | {ada['final_train_loss']:.4f} |\n"
-        f"| 峰值显存(GB) | {uni['peak_memory_gb']:.2f} | {dyn['peak_memory_gb']:.2f} | {ada['peak_memory_gb']:.2f} |\n"
-        f"| 可训练参数 | {uni['trainable_params']} | {dyn['trainable_params']} | {ada['trainable_params']} |\n"
-        f"| 训练时间(s) | {uni['seconds']:.1f} | {dyn['seconds']:.1f} | {ada['seconds']:.1f} |\n"
-        f"| 吞吐量(steps/s) | {uni['steps_per_sec']:.2f} | {dyn['steps_per_sec']:.2f} | {ada['steps_per_sec']:.2f} |\n\n"
-        f"训练样本: {len(train_texts)}, 评估样本: {len(eval_prompts)}, 步数: {args.steps}, rank_budget={args.rank_budget}\n"
+    # 按运行顺序生成对比摘要
+    labels = {
+        "uniform": "Uniform LoRA",
+        "dynamic": "Dynamic (EMA)",
+        "dynamic_u": "Dynamic-U (ours)",
+        "adaloora": "AdaLoRA",
+    }
+    modes = [r["mode"] for r in results]
+    metrics = [
+        ("验证准确率", "eval_accuracy", ".4f"),
+        ("验证损失", "eval_loss", ".4f"),
+        ("最终训练损失", "final_train_loss", ".4f"),
+        ("峰值显存(GB)", "peak_memory_gb", ".2f"),
+        ("可训练参数", "trainable_params", ""),
+        ("训练时间(s)", "seconds", ".1f"),
+        ("吞吐量(steps/s)", "steps_per_sec", ".2f"),
+    ]
+    lines = [
+        "# 真实模型实验结果（Qwen2.5-0.5B-Instruct + GLUE SST-2）\n",
+        "| 指标 | " + " | ".join(labels[m] for m in modes) + " |",
+        "|---" * (len(modes) + 1) + "|",
+    ]
+    for name, key, fmt in metrics:
+        cells = []
+        for r in results:
+            v = r[key]
+            cells.append(f"{v:{fmt}}" if fmt else str(v))
+        lines.append(f"| {name} | " + " | ".join(cells) + " |")
+    lines.append("")
+    lines.append(
+        f"训练样本: {len(train_texts)}, 评估样本: {len(eval_prompts)}, 步数: {args.steps}, "
+        f"rank_budget={args.rank_budget}, uncertainty_beta={args.uncertainty_beta}\n"
     )
+    summary = "\n".join(lines)
     (output / "real_results.md").write_text(summary, encoding="utf-8")
     print("\n" + summary)
     print(f"[INFO] 结果已保存到 {output}")

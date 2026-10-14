@@ -53,7 +53,10 @@ def run(mode, args, out):
         opt.step()
         if mode=='dynamic' and step>=args.warmup_steps and step%args.allocation_interval==0: allocator.rebalance(step, update_importance=False)
         losses.append(float(loss.item()))
-    elapsed=time.time()-start; result={'mode':mode,'device':str(device),'final_loss':losses[-1],'mean_last_20':float(np.mean(losses[-20:])),'steps_per_sec':args.steps/elapsed,'trainable_params':sum(p.numel() for p in model.parameters() if p.requires_grad),'rank_history':allocator.history}
+    elapsed=time.time()-start
+    active_adapter_params=sum(layer.active_parameter_count for layer in layers.values())
+    peak_memory_gb=(torch.cuda.max_memory_allocated(device) / 1e9) if device.type == 'cuda' else 0.0
+    result={'mode':mode,'device':str(device),'final_loss':losses[-1],'mean_last_20':float(np.mean(losses[-20:])),'steps_per_sec':args.steps/elapsed,'trainable_params':sum(p.numel() for p in model.parameters() if p.requires_grad),'active_adapter_params':active_adapter_params,'peak_memory_gb':peak_memory_gb,'rank_history':allocator.history}
     torch.save({'model':model.state_dict(),'ranks':{n:l.rank for n,l in layers.items()},'config':vars(args)},out/'checkpoint.pt')
     (out/'metrics.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8'); (out/'losses.json').write_text(json.dumps(losses),encoding='utf-8'); return result
 

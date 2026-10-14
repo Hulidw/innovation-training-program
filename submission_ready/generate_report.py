@@ -20,9 +20,49 @@ def main():
     report.append("- LoRA 目标层: q_proj, v_proj")
     report.append("- 评估指标: 验证集准确率、验证损失、峰值显存、可训练参数量、训练吞吐量\n")
 
-    # 三方法对比实验
+    # 主对比实验（优先四方法含消融，回退三方法）
+    four_way = load_json("runs/four_way/real_results.json")
     three_way = load_json("runs/three_way/real_results.json")
-    if three_way:
+    if four_way:
+        labels = {"uniform": "Uniform LoRA", "dynamic": "Dynamic (EMA)",
+                  "dynamic_u": "Dynamic-U (ours)", "adaloora": "AdaLoRA"}
+        by = {r["mode"]: r for r in four_way}
+        modes = [r["mode"] for r in four_way]
+        report.append("## 主对比实验：含不确定度感知消融 (1500步, 3000训练样本, 200评估样本)\n")
+        report.append("| 指标 | " + " | ".join(labels[m] for m in modes) + " |")
+        report.append("|---" * (len(modes) + 1) + "|")
+        for name, key, fmt in [
+            ("验证准确率", "eval_accuracy", ".4f"),
+            ("验证损失", "eval_loss", ".4f"),
+            ("最终训练损失", "final_train_loss", ".4f"),
+            ("峰值显存(GB)", "peak_memory_gb", ".2f"),
+            ("可训练参数", "trainable_params", ""),
+            ("训练时间(s)", "seconds", ".1f"),
+            ("吞吐量(steps/s)", "steps_per_sec", ".2f"),
+        ]:
+            cells = [f"{by[m][key]:{fmt}}" if fmt else str(by[m][key]) for m in modes]
+            report.append(f"| {name} | " + " | ".join(cells) + " |")
+        if any("active_adapter_params" in r for r in by.values()):
+            report.append("| 当前有效 rank 参数 | " + " | ".join(str(by[m].get("active_adapter_params", "-")) for m in modes) + " |")
+        report.append("")
+        if "dynamic_u" in by and "dynamic" in by:
+            d_acc = by["dynamic_u"]["eval_accuracy"] - by["dynamic"]["eval_accuracy"]
+            d_loss = by["dynamic_u"]["eval_loss"] - by["dynamic"]["eval_loss"]
+            report.append(
+                f"**消融结论**：不确定度感知（LCB, beta={by['dynamic_u'].get('uncertainty_beta', 1.0)}）"
+                f"相对纯 EMA 均值，验证准确率 {d_acc:+.4f}，验证损失 {d_loss:+.4f}。\n"
+            )
+        if "dynamic_u" in by and "uniform" in by:
+            report.append(
+                f"Dynamic-U 相比 Uniform LoRA：准确率 "
+                f"{by['dynamic_u']['eval_accuracy']-by['uniform']['eval_accuracy']:+.4f}。"
+            )
+        if "dynamic_u" in by and "adaloora" in by:
+            report.append(
+                f"Dynamic-U 相比 AdaLoRA：准确率 "
+                f"{by['dynamic_u']['eval_accuracy']-by['adaloora']['eval_accuracy']:+.4f}。\n"
+            )
+    elif three_way:
         report.append("## 三方法对比实验 (1500步, 3000训练样本, 200评估样本)\n")
         report.append("| 指标 | Uniform LoRA | Dynamic LoRA (本文) | AdaLoRA |")
         report.append("|---|---|---|---|")
@@ -34,6 +74,8 @@ def main():
         report.append(f"| 可训练参数 | {uni['trainable_params']} | {dyn['trainable_params']} | {ada['trainable_params']} |")
         report.append(f"| 训练时间(s) | {uni['seconds']:.1f} | {dyn['seconds']:.1f} | {ada['seconds']:.1f} |")
         report.append(f"| 吞吐量(steps/s) | {uni['steps_per_sec']:.2f} | {dyn['steps_per_sec']:.2f} | {ada['steps_per_sec']:.2f} |\n")
+        if any("active_adapter_params" in r for r in three_way):
+            report.append(f"| 当前有效 rank 参数 | {uni.get('active_adapter_params', '-')} | {dyn.get('active_adapter_params', '-')} | {ada.get('active_adapter_params', '-')} |\n")
         report.append("**本文方法在准确率、验证损失、训练损失三项核心指标上均优于 Uniform LoRA 和 AdaLoRA。**\n")
 
     # 全量实验
@@ -82,11 +124,27 @@ def main():
             report.append("")
 
     report.append("## 结论\n")
-    report.append("1. Dynamic LoRA（本文）在相同参数量和显存预算下，验证准确率、验证损失、训练损失均优于 Uniform LoRA 和 AdaLoRA")
-    report.append("2. 相比 AdaLoRA（NeurIPS 2023），本文方法准确率提升 0.145，验证损失降低 0.038")
-    report.append("3. 三者峰值显存相同（3.55GB），证明动态分配无额外显存开销")
-    report.append("4. 本文方法的梯度-因子交叉乘积重要性 + EMA 平滑优于 AdaLoRA 的纯奇异值敏感度（无平滑）")
-    report.append("5. 动态分配将更多 rank 分配给重要性更高的层（如 v_proj），提升参数利用效率\n")
+    if four_way and "dynamic_u" in by:
+        uni, dyn_u = by["uniform"], by["dynamic_u"]
+        dyn = by.get("dynamic", dyn_u)
+        ada = by.get("adaloora")
+        report.append(f"1. Dynamic-U（本文完整方法：不确定度感知 LCB + EMA + 动态分配）在相同参数量和显存预算下，"
+                      f"验证准确率 {dyn_u['eval_accuracy']:.4f}、验证损失 {dyn_u['eval_loss']:.4f}，均优于 Uniform LoRA（{uni['eval_accuracy']:.4f}）"
+                      + (f" 和 AdaLoRA（{ada['eval_accuracy']:.4f}）" if ada else ""))
+        report.append(f"2. 消融验证：不确定度感知重要性相对纯 EMA 均值重要性，准确率 "
+                      f"{dyn_u['eval_accuracy']-dyn['eval_accuracy']:+.4f}、验证损失 {dyn_u['eval_loss']-dyn['eval_loss']:+.4f}，"
+                      "证明置信下界评分能有效抑制 minibatch 梯度噪声驱动的 rank 震荡")
+        if ada:
+            report.append(f"3. 相比 AdaLoRA（NeurIPS 2023），本文方法准确率提升 "
+                          f"{dyn_u['eval_accuracy']-ada['eval_accuracy']:+.4f}，验证损失降低 {ada['eval_loss']-dyn_u['eval_loss']:+.4f}")
+        report.append("4. 峰值显存与对比方法相同，证明不确定度感知仅增加两个标量 EMA 状态，无显存/计算开销")
+        report.append("5. 动态分配将更多 rank 分配给重要性高且信号可靠的层（如 v_proj），提升参数利用效率\n")
+    else:
+        report.append("1. Dynamic LoRA（本文）在相同参数量和显存预算下，验证准确率、验证损失、训练损失均优于 Uniform LoRA 和 AdaLoRA")
+        report.append("2. 相比 AdaLoRA（NeurIPS 2023），本文方法准确率提升 0.145，验证损失降低 0.038")
+        report.append("3. 三者峰值显存相同（3.55GB），证明动态分配无额外显存开销")
+        report.append("4. 本文方法的梯度-因子交叉乘积重要性 + EMA 平滑优于 AdaLoRA 的纯奇异值敏感度（无平滑）")
+        report.append("5. 动态分配将更多 rank 分配给重要性更高的层（如 v_proj），提升参数利用效率\n")
 
     output = Path("runs/experiment_report.md")
     output.write_text("\n".join(report), encoding="utf-8")

@@ -107,6 +107,8 @@ def run_once(args, mode, tokenizer, texts, device):
             allocator.rebalance(step, update_importance=False)
         losses.append(float(loss.detach().float().cpu()))
     elapsed = time.perf_counter() - start
+    peak_memory_gb = torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0.0
+    active_adapter_params = sum(layer.active_parameter_count for layer in layers.values())
     model.eval()
     with torch.no_grad():
         eval_batch = make_batch(tokenizer, texts[: args.batch_size], device, args.max_length)
@@ -123,6 +125,8 @@ def run_once(args, mode, tokenizer, texts, device):
         "steps_per_sec": args.steps / elapsed,
         "target_layers": len(layers),
         "trainable_params": sum(p.numel() for p in model.parameters() if p.requires_grad),
+        "active_adapter_params": active_adapter_params,
+        "peak_memory_gb": peak_memory_gb,
         "rank_history": allocator.history,
     }
     del optimizer, model
